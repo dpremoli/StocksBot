@@ -20,7 +20,7 @@ async def init_db():
 
 
 def _today() -> str:
-    return datetime.datetime.now(datetime.UTC).date().isoformat()
+    return datetime.datetime.utcnow().date().isoformat()
 
 
 async def get_cached(isin: str, currency: str) -> float | None:
@@ -43,7 +43,7 @@ async def set_cached(isin: str, currency: str, price: float):
                 currency.upper(),
                 _today(),
                 price,
-                datetime.datetime.now(datetime.UTC).isoformat(),
+                datetime.datetime.utcnow().isoformat(),
             ),
         )
         await db.commit()
