@@ -12,7 +12,7 @@ COPY app/ ./app/
 
 RUN mkdir -p /data
 
-RUN useradd -m -u 1000 pricebot && chown -R pricebot:pricebot /app /data
+RUN useradd -m -u 1100 pricebot && chown -R pricebot:pricebot /app /data
 USER pricebot
 
 EXPOSE 8000
