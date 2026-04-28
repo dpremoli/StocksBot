@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  price-bot:
+    container_name: price-bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: price-bot:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - /mnt/user/appdata/price-bot:/data
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/London
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
