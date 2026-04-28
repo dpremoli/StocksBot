@@ -9,7 +9,7 @@ services:
     image: price-bot:latest
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8150:8000"
     volumes:
       - /mnt/user/appdata/price-bot:/data
     environment:
