@@ -1,4 +1,5 @@
 fastapi
+requests
 uvicorn[standard]
 playwright==1.44.0
 aiosqlite
