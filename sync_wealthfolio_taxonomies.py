@@ -186,6 +186,15 @@ def delete_auto_assignments(db: sqlite3.Connection, asset_id: str, taxonomy_id: 
     )
 
 
+def delete_all_assignments(db: sqlite3.Connection, asset_id: str, taxonomy_id: str):
+    """Delete all assignments regardless of source — used for single-value
+    taxonomies where Wealthfolio auto-adds parent entries with source='AUTO'."""
+    db.execute(
+        "DELETE FROM asset_taxonomy_assignments WHERE asset_id=? AND taxonomy_id=?",
+        (asset_id, taxonomy_id),
+    )
+
+
 def process_asset(db: sqlite3.Connection, asset_id: str, isin: str, currency: str, name: str):
     print(f"\n{'─'*60}")
     print(f"  {name} ({isin}) [{currency}]")
@@ -215,7 +224,7 @@ def process_asset(db: sqlite3.Connection, asset_id: str, isin: str, currency: st
     instr_id = FT_FUND_TYPE_TO_INSTRUMENT.get(fund_type)
     if instr_id:
         ensure_category(db, "instrument_type", instr_id, fund_type)
-        delete_auto_assignments(db, asset_id, "instrument_type")
+        delete_all_assignments(db, asset_id, "instrument_type")
         upsert_assignment(db, asset_id, "instrument_type", instr_id, 10000)
 
     # ── asset_classes ───────────────────────────────────────────────────────
@@ -235,7 +244,7 @@ def process_asset(db: sqlite3.Connection, asset_id: str, isin: str, currency: st
                 class_id = "EQUITY"
 
         ensure_category(db, "asset_classes", class_id, asset_type)
-        delete_auto_assignments(db, asset_id, "asset_classes")
+        delete_all_assignments(db, asset_id, "asset_classes")
         upsert_assignment(db, asset_id, "asset_classes", class_id, 10000)
 
     # ── industries_gics (with weights) ─────────────────────────────────────

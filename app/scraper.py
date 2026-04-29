@@ -7,10 +7,12 @@ from playwright.async_api import TimeoutError as PwTimeout
 FT_URL = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}:{currency}"
 FT_URL_NO_CCY = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}"
 
-# Holdings tab — tried in order: ETF then fund
+# Holdings tab — tried in order: ETF+ccy, Fund+ccy, ETF no-ccy, Fund no-ccy
 _HOLDINGS_URLS = [
     "https://markets.ft.com/data/etfs/tearsheet/holdings?s={isin}:{currency}",
     "https://markets.ft.com/data/funds/tearsheet/holdings?s={isin}:{currency}",
+    "https://markets.ft.com/data/etfs/tearsheet/holdings?s={isin}",
+    "https://markets.ft.com/data/funds/tearsheet/holdings?s={isin}",
 ]
 
 _SELECTORS = [
