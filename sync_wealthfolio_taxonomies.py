@@ -105,13 +105,23 @@ FT_REGION_TO_ID = {
 }
 
 # ── Asset type → asset_classes category ID ─────────────────────────────────
+# Use top-level IDs only — Wealthfolio auto-rolls up children and would
+# double-count if we assigned both parent and child.
 FT_ASSET_TYPE_TO_CLASS = {
-    "Equity":         "EQUITY_PUBLIC",
+    "Equity":         "EQUITY",
     "Fixed Income":   "FIXED_INCOME",
-    "Mixed":          "EQUITY",        # closest multi-asset proxy
+    "Mixed":          "EQUITY",
     "Cash":           "CASH",
-    "Commodity":      "COMM_PRECIOUS", # fallback; override per-fund if needed
+    "Commodity":      "COMM_PRECIOUS",
     "Real Estate":    "RE_PUBLIC_REITS",
+}
+
+# FT macro region names that aggregate child rows — skip these when the
+# response also contains their children (to avoid double-counting weights).
+FT_MACRO_REGIONS = {
+    "Americas", "Greater Europe", "Greater Asia",
+    "Europe", "Asia", "Africa", "Oceania",
+    "Northern America", "Latin America",
 }
 
 # ── Fund type → instrument_type category ID ────────────────────────────────
@@ -246,8 +256,20 @@ def process_asset(db: sqlite3.Connection, asset_id: str, isin: str, currency: st
     # ── regions (with weights) ──────────────────────────────────────────────
     regions = info.get("regions", [])
     if regions:
+        # Drop macro rows (Americas, Greater Europe…) when the response also
+        # contains their children — otherwise weights double-count.
+        region_names = {r["name"] for r in regions}
+        filtered_regions = [
+            r for r in regions
+            if r["name"] not in FT_MACRO_REGIONS
+            or not any(
+                r2["name"] not in FT_MACRO_REGIONS
+                and abs(r2["weight"] - r["weight"]) < 1.0
+                for r2 in regions
+            )
+        ]
         delete_auto_assignments(db, asset_id, "regions")
-        for r in regions:
+        for r in filtered_regions:
             rname  = r["name"]
             weight = int(round(r["weight"] * 100))
             cat_id = FT_REGION_TO_ID.get(rname)
@@ -263,28 +285,25 @@ def main():
     db.row_factory = sqlite3.Row
 
     # All active assets that have the custom scraper configured
+    # ISIN is stored in instrument_symbol; currency in quote_ccy
     assets = db.execute("""
-        SELECT id, isin, currency, name
+        SELECT id, instrument_symbol AS isin, quote_ccy AS currency, name
         FROM assets
         WHERE is_active = 1
-          AND isin IS NOT NULL
-          AND isin != ''
-          AND (
-              provider_config LIKE '%CUSTOM_SCRAPER%'
-              OR quote_mode = 'CUSTOM_SCRAPER'
-          )
+          AND instrument_symbol IS NOT NULL
+          AND instrument_symbol != ''
+          AND provider_config LIKE '%CUSTOM_SCRAPER%'
         ORDER BY name
     """).fetchall()
 
     print(f"Found {len(assets)} active assets with custom scraper\n")
 
     if not assets:
-        # Fallback: try all active assets with an ISIN (funds without explicit provider)
         assets = db.execute("""
-            SELECT id, isin, currency, name
+            SELECT id, instrument_symbol AS isin, quote_ccy AS currency, name
             FROM assets
             WHERE is_active = 1
-              AND isin IS NOT NULL AND isin != ''
+              AND instrument_symbol IS NOT NULL AND instrument_symbol != ''
             ORDER BY name
         """).fetchall()
         print(f"Falling back to all {len(assets)} active assets with ISIN\n")
