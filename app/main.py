@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
-from app.cache import init_db, get_cached, set_cached
-from app.models import BatchRequest, BatchResponse
-from app.scraper import scrape_price, get_browser, close_browser, PriceNotFoundError, FTBlockedError
+from app.cache import init_db, get_cached, set_cached, get_cached_info, set_cached_info
+from app.models import BatchRequest, BatchResponse, FundInfo, BatchInfoRequest, BatchInfoResponse
+from app.scraper import scrape_price, scrape_fund_info, get_browser, close_browser, PriceNotFoundError, FTBlockedError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,3 +89,57 @@ async def batch_prices(body: BatchRequest):
         await asyncio.sleep(1.5)
 
     return BatchResponse(prices=prices, errors=errors)
+
+
+@app.get("/info", response_model=FundInfo)
+async def get_fund_info(
+    isin: str = Query(..., min_length=12, max_length=12),
+    currency: str = Query("EUR", min_length=3, max_length=3),
+):
+    cached = await get_cached_info(isin)
+    if cached is not None:
+        log.info("INFO CACHE HIT  %s", isin.upper())
+        return FundInfo(**cached)
+
+    try:
+        data = await scrape_fund_info(isin, currency)
+    except PriceNotFoundError as e:
+        log.warning("INFO NOT FOUND  %s -> %s", isin.upper(), e)
+        raise HTTPException(status_code=404, detail=str(e))
+    except FTBlockedError as e:
+        log.warning("INFO BLOCKED    %s -> %s", isin.upper(), e)
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        log.error("INFO ERROR      %s -> %s", isin.upper(), e)
+        raise HTTPException(status_code=500, detail=f"Scrape error: {e}")
+
+    await set_cached_info(isin, data)
+    log.info("INFO SCRAPED    %s -> %s sectors, %s regions", isin.upper(), len(data["sectors"]), len(data["regions"]))
+    return FundInfo(**data)
+
+
+@app.post("/batch-info", response_model=BatchInfoResponse)
+async def batch_fund_info(body: BatchInfoRequest):
+    info: dict[str, FundInfo] = {}
+    errors: dict[str, str] = {}
+
+    for isin in body.isins:
+        cached = await get_cached_info(isin)
+        if cached is not None:
+            info[isin] = FundInfo(**cached)
+            continue
+        try:
+            data = await scrape_fund_info(isin, body.currency)
+            await set_cached_info(isin, data)
+            info[isin] = FundInfo(**data)
+            log.info("INFO SCRAPED    %s", isin.upper())
+        except PriceNotFoundError:
+            errors[isin] = "not_found"
+        except FTBlockedError:
+            errors[isin] = "blocked"
+        except Exception as e:
+            errors[isin] = f"error: {e}"
+            log.error("INFO ERROR      %s -> %s", isin.upper(), e)
+        await asyncio.sleep(1.5)
+
+    return BatchInfoResponse(info=info, errors=errors)

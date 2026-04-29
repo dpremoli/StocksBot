@@ -7,6 +7,12 @@ from playwright.async_api import TimeoutError as PwTimeout
 FT_URL = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}:{currency}"
 FT_URL_NO_CCY = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}"
 
+# Holdings tab — tried in order: ETF then fund
+_HOLDINGS_URLS = [
+    "https://markets.ft.com/data/etfs/tearsheet/holdings?s={isin}:{currency}",
+    "https://markets.ft.com/data/funds/tearsheet/holdings?s={isin}:{currency}",
+]
+
 _SELECTORS = [
     ".mod-tearsheet-overview__quote .mod-ui-data-list__value",
     "span.mod-ui-data-list__value",
@@ -93,15 +99,194 @@ async def _extract_price(page) -> float | None:
     ):
         return None
 
+    # Detect pence-quoted instruments (GBp/GBX) — divide price by 100 to get GBP
+    is_pence = False
+    currency_els = await page.query_selector_all(".mod-tearsheet-overview__quote .mod-ui-data-list__label")
+    for el in currency_els:
+        label = (await el.inner_text()).strip()
+        if label in ("GBp", "GBX", "pence"):
+            is_pence = True
+            break
+    if not is_pence:
+        # Fallback: check the quote block text for GBp
+        quote_el = await page.query_selector(".mod-tearsheet-overview__quote")
+        if quote_el:
+            quote_text = await quote_el.inner_text()
+            if "GBp" in quote_text or "GBX" in quote_text:
+                is_pence = True
+
     for selector in _SELECTORS:
         elements = await page.query_selector_all(selector)
         for el in elements:
             raw = (await el.inner_text()).strip()
             price = _parse_price(raw)
             if price is not None:
-                return price
+                return round(price / 100, 6) if is_pence else price
 
     return None
+
+
+def _parse_pct(raw: str) -> float | None:
+    cleaned = raw.strip().replace("%", "").replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+async def _extract_allocation_table(page) -> list[dict]:
+    """Extract rows from the currently-visible allocation/weightings table."""
+    rows = await page.evaluate("""() => {
+        const results = [];
+        // Asset allocation table: rows under section with 'Asset allocation' heading
+        const tables = document.querySelectorAll('table');
+        for (const table of tables) {
+            const rows_els = table.querySelectorAll('tbody tr');
+            if (rows_els.length === 0) continue;
+            for (const tr of rows_els) {
+                const cells = tr.querySelectorAll('td');
+                if (cells.length >= 2) {
+                    const name = cells[0].innerText.trim();
+                    const pct = cells[1].innerText.trim();
+                    if (name && pct) results.push({name, pct});
+                }
+            }
+            if (results.length > 0) break;
+        }
+        return results;
+    }""")
+    out = []
+    for row in rows:
+        pct = _parse_pct(row["pct"])
+        if pct is not None and pct > 0:
+            out.append({"name": row["name"], "weight": pct})
+    return out
+
+
+async def _extract_weightings_table(page) -> list[dict]:
+    """Extract rows from the currently-visible weightings table (sectors or regions).
+
+    FT uses the same 'Sector' column header for both views; visibility (offsetParent)
+    distinguishes which tab is active.
+    """
+    rows = await page.evaluate("""() => {
+        const results = [];
+        const tables = document.querySelectorAll('table');
+        for (const table of tables) {
+            // Skip hidden tables
+            if (table.offsetParent === null) continue;
+            const header = table.querySelector('thead th, thead td');
+            if (!header) continue;
+            const headerText = header.innerText.trim().toLowerCase();
+            if (headerText !== 'sector' && headerText !== 'region') continue;
+            const rows_els = table.querySelectorAll('tbody tr');
+            for (const tr of rows_els) {
+                const cells = tr.querySelectorAll('td');
+                if (cells.length >= 2) {
+                    const name = cells[0].innerText.trim();
+                    const pct = cells[1].innerText.trim();
+                    if (name) results.push({name, pct});
+                }
+            }
+            if (results.length > 0) break;
+        }
+        return results;
+    }""")
+    out = []
+    for row in rows:
+        pct = _parse_pct(row["pct"])
+        if pct is not None and pct > 0 and row["name"].lower() != "other":
+            out.append({"name": row["name"], "weight": pct})
+    return out
+
+
+async def _extract_fund_name(page) -> str | None:
+    try:
+        el = await page.query_selector("h1.mod-tearsheet-overview__name, h1.mod-ui-tearsheet__title, h1")
+        if el:
+            return (await el.inner_text()).strip() or None
+    except Exception:
+        pass
+    return None
+
+
+async def scrape_fund_info(isin: str, currency: str) -> dict:
+    """Scrape asset type, sectors, and regions from the FT holdings tab."""
+    async with _semaphore:
+        browser = await get_browser()
+        context = await browser.new_context(
+            user_agent=_USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
+        try:
+            loaded_url = None
+            for url_tpl in _HOLDINGS_URLS:
+                url = url_tpl.format(isin=isin.upper(), currency=currency.upper())
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if response and response.status == 403:
+                    raise FTBlockedError(f"FT returned 403 for {isin}")
+                if not _is_search_page(page.url):
+                    loaded_url = page.url
+                    break
+
+            if loaded_url is None:
+                raise PriceNotFoundError(f"FT has no holdings page for ISIN {isin}")
+
+            # Wait for allocation section to render
+            try:
+                await page.wait_for_selector("table", timeout=15000)
+            except PwTimeout:
+                pass
+
+            name = await _extract_fund_name(page)
+            assets = await _extract_allocation_table(page)
+            sectors = await _extract_weightings_table(page)
+
+            # Click the "Regions" tab and wait for the table header to switch
+            regions = []
+            try:
+                regions_btn = await page.query_selector(
+                    "li:has-text('Regions'), button:has-text('Regions'), a:has-text('Regions')"
+                )
+                if regions_btn:
+                    await regions_btn.click()
+                    await page.wait_for_timeout(500)  # CSS show/hide is synchronous
+                    regions = await _extract_weightings_table(page)
+            except Exception:
+                pass
+
+            # Derive a simple asset_type label from the assets breakdown
+            asset_type = None
+            if assets:
+                stock_pct = sum(
+                    a["weight"] for a in assets
+                    if "stock" in a["name"].lower() or "equity" in a["name"].lower()
+                )
+                bond_pct = sum(
+                    a["weight"] for a in assets
+                    if "bond" in a["name"].lower() or "fixed" in a["name"].lower()
+                )
+                if stock_pct >= 70:
+                    asset_type = "Equity"
+                elif bond_pct >= 70:
+                    asset_type = "Fixed Income"
+                elif stock_pct > 0 and bond_pct > 0:
+                    asset_type = "Mixed"
+                elif assets:
+                    asset_type = assets[0]["name"]
+
+            return {
+                "isin": isin.upper(),
+                "name": name,
+                "asset_type": asset_type,
+                "fund_type": "ETF" if "etfs" in loaded_url else "Fund",
+                "assets": assets,
+                "sectors": sectors,
+                "regions": regions,
+            }
+        finally:
+            await context.close()
 
 
 async def scrape_price(isin: str, currency: str) -> float:

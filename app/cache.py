@@ -1,4 +1,5 @@
 import datetime
+import json
 import aiosqlite
 
 DB_PATH = "/data/prices.db"
@@ -14,6 +15,15 @@ async def init_db():
                 price      REAL NOT NULL,
                 fetched_at TEXT NOT NULL,
                 PRIMARY KEY (isin, currency, date)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fund_info (
+                isin       TEXT NOT NULL,
+                date       TEXT NOT NULL,
+                data       TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (isin, date)
             )
         """)
         await db.commit()
@@ -45,5 +55,24 @@ async def set_cached(isin: str, currency: str, price: float):
                 price,
                 datetime.datetime.utcnow().isoformat(),
             ),
+        )
+        await db.commit()
+
+
+async def get_cached_info(isin: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT data FROM fund_info WHERE isin=? AND date=?",
+            (isin.upper(), _today()),
+        )
+        row = await cursor.fetchone()
+        return json.loads(row[0]) if row else None
+
+
+async def set_cached_info(isin: str, data: dict):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO fund_info(isin, date, data, fetched_at) VALUES(?,?,?,?)",
+            (isin.upper(), _today(), json.dumps(data), datetime.datetime.utcnow().isoformat()),
         )
         await db.commit()
