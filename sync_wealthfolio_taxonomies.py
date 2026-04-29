@@ -58,6 +58,8 @@ FT_REGION_TO_ID = {
     "Europe - ex Euro":   "R10",
     "Asia - Developed":   "R3030",
     "Asia - Emerging":    "R30",
+    "Emerging Markets":   "R30",
+    "Emerging Market":    "R30",
     "Japan":              "country_JP",
     "Australasia":        "R5010",
     # countries

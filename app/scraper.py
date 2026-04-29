@@ -212,6 +212,65 @@ async def _extract_fund_name(page) -> str | None:
     return None
 
 
+_SUMMARY_URLS = [
+    "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}:{currency}",
+    "https://markets.ft.com/data/funds/tearsheet/summary?s={isin}:{currency}",
+    "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}",
+    "https://markets.ft.com/data/funds/tearsheet/summary?s={isin}",
+]
+
+
+async def _scrape_summary_regions(page, isin: str, currency: str) -> list[dict]:
+    """Scrape the top-5 regions from the summary page Diversification section."""
+    for url_tpl in _SUMMARY_URLS:
+        url = url_tpl.format(isin=isin.upper(), currency=currency.upper())
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            if response and response.status == 403:
+                return []
+            if _is_search_page(page.url):
+                continue
+        except Exception:
+            continue
+
+        try:
+            await page.wait_for_selector(".mod-tearsheet-overview__diversification", timeout=8000)
+        except PwTimeout:
+            pass
+
+        rows = await page.evaluate("""() => {
+            const results = [];
+            // Find the TOP 5 REGIONS heading then collect its sibling rows
+            const headings = [...document.querySelectorAll('h3, h4, strong, b, .mod-tearsheet-overview__diversification-title')];
+            let regionSection = null;
+            for (const h of headings) {
+                if (h.innerText && h.innerText.trim().toUpperCase().includes('REGION')) {
+                    regionSection = h.closest('section, div, td') || h.parentElement;
+                    break;
+                }
+            }
+            if (!regionSection) return results;
+
+            const rows = regionSection.querySelectorAll('li, tr, .mod-tearsheet-overview__diversification-item');
+            for (const row of rows) {
+                const text = row.innerText.trim();
+                const match = text.match(/^(.+?)\\s+(\\d+\\.?\\d*)%/);
+                if (match) results.push({name: match[1].trim(), pct: match[2]});
+            }
+            return results;
+        }""")
+
+        out = []
+        for row in rows:
+            pct = _parse_pct(row["pct"])
+            if pct is not None and pct > 0 and row["name"].lower() != "other":
+                out.append({"name": row["name"], "weight": pct})
+        if out:
+            return out
+
+    return []
+
+
 async def scrape_fund_info(isin: str, currency: str) -> dict:
     """Scrape asset type, sectors, and regions from the FT holdings tab."""
     async with _semaphore:
@@ -257,6 +316,11 @@ async def scrape_fund_info(isin: str, currency: str) -> dict:
                     regions = await _extract_weightings_table(page)
             except Exception:
                 pass
+
+            # Fallback: scrape regions from the summary page Diversification section
+            # when the holdings tab Regions tab click didn't yield data
+            if not regions:
+                regions = await _scrape_summary_regions(page, isin, currency)
 
             # Derive a simple asset_type label from the assets breakdown
             asset_type = None
