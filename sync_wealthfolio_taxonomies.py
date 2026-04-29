@@ -8,15 +8,16 @@ Run on the NAS where both databases are accessible:
 Requirements: pip install requests
 """
 
+import os
 import sqlite3
 import uuid
 import requests
 from datetime import datetime, timezone
 
 # ── Config ─────────────────────────────────────────────────────────────────
-WEALTHFOLIO_DB  = "/mnt/user/appdata/wealthfolio/wealthfolio.db"
-PRICE_BOT_URL   = "http://localhost:8150"   # price bot base URL on the NAS
-DRY_RUN         = False                     # set True to preview without writing
+WEALTHFOLIO_DB  = os.environ.get("WF_DB", "/mnt/user/appdata/wealthfolio/wealthfolio.db")
+PRICE_BOT_URL   = os.environ.get("PRICE_BOT_URL", "http://localhost:8150")
+DRY_RUN         = os.environ.get("DRY_RUN", "").lower() in ("1", "true")
 
 # ── Sector name → industries_gics category ID ──────────────────────────────
 # FT uses Morningstar sector names; map to closest GICS industry group.
