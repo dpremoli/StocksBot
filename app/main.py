@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from app.cache import init_db, get_cached, set_cached
 from app.models import BatchRequest, BatchResponse
-from app.scraper import scrape_price, PriceNotFoundError, FTBlockedError
+from app.scraper import scrape_price, get_browser, close_browser, PriceNotFoundError, FTBlockedError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await get_browser()
     yield
+    await close_browser()
 
 
 app = FastAPI(title="FT NAV Price Bot", lifespan=lifespan)

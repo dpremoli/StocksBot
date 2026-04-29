@@ -1,6 +1,7 @@
+import asyncio
 import re
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Browser
 from playwright.async_api import TimeoutError as PwTimeout
 
 FT_URL = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}:{currency}"
@@ -25,6 +26,11 @@ _USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Shared browser instance and concurrency limiter
+_browser: Browser | None = None
+_playwright_ctx = None
+_semaphore = asyncio.Semaphore(3)  # max 3 concurrent pages
+
 
 class PriceNotFoundError(Exception):
     pass
@@ -34,8 +40,34 @@ class FTBlockedError(Exception):
     pass
 
 
+async def get_browser() -> Browser:
+    global _browser, _playwright_ctx
+    if _browser is None or not _browser.is_connected():
+        if _playwright_ctx is not None:
+            try:
+                await _playwright_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+        _playwright_ctx = async_playwright()
+        pw = await _playwright_ctx.__aenter__()
+        _browser = await pw.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
+    return _browser
+
+
+async def close_browser():
+    global _browser, _playwright_ctx
+    if _browser is not None:
+        await _browser.close()
+        _browser = None
+    if _playwright_ctx is not None:
+        try:
+            await _playwright_ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+        _playwright_ctx = None
+
+
 def _parse_price(raw: str) -> float | None:
-    """Return positive float from raw text, or None if unparseable/zero."""
     cleaned = re.sub(r"[^\d.]", "", raw.replace(",", ""))
     try:
         value = float(cleaned)
@@ -45,12 +77,10 @@ def _parse_price(raw: str) -> float | None:
 
 
 def _is_search_page(url: str) -> bool:
-    """Returns True if FT redirected to a search/no-result page."""
     return "/data/search" in url or "query=" in url
 
 
 async def _extract_price(page) -> float | None:
-    """Try all selectors and return first valid price, or None."""
     try:
         await page.wait_for_selector(".mod-tearsheet-overview__quote", timeout=15000)
     except PwTimeout:
@@ -75,22 +105,20 @@ async def _extract_price(page) -> float | None:
 
 
 async def scrape_price(isin: str, currency: str) -> float:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
+    async with _semaphore:
+        browser = await get_browser()
         context = await browser.new_context(
             user_agent=_USER_AGENT,
             viewport={"width": 1280, "height": 900},
         )
         page = await context.new_page()
         try:
-            # First attempt: with currency
             url = FT_URL.format(isin=isin.upper(), currency=currency.upper())
             response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             if response and response.status == 403:
                 raise FTBlockedError(f"FT returned 403 for {isin}")
 
-            # If FT redirected to a search page, retry without currency suffix
             if _is_search_page(page.url):
                 url_no_ccy = FT_URL_NO_CCY.format(isin=isin.upper())
                 response = await page.goto(url_no_ccy, wait_until="domcontentloaded", timeout=30000)
@@ -105,4 +133,4 @@ async def scrape_price(isin: str, currency: str) -> float:
             raise PriceNotFoundError(f"Could not extract price for {isin} from {page.url}")
 
         finally:
-            await browser.close()
+            await context.close()
