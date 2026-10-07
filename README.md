@@ -19,6 +19,7 @@ over a simple JSON REST API. Designed to integrate with
   - [Step 1 — Add a Custom Provider](#step-1--add-a-custom-provider)
   - [Step 2 — Configure the URL and price path](#step-2--configure-the-url-and-price-path)
   - [Step 3 — Assign the provider to an asset](#step-3--assign-the-provider-to-an-asset)
+- [Syncing fund classifications into Wealthfolio](#syncing-fund-classifications-into-wealthfolio)
 - [Caching](#caching)
 - [Troubleshooting](#troubleshooting)
 
@@ -255,7 +256,7 @@ Fetch metadata for multiple ISINs. Same 1.5 s inter-request delay as `/batch`.
 
 ## Connecting to Wealthfolio
 
-Wealthfolio (v3.1+) supports **Custom Market Data Providers** — you supply a
+Wealthfolio (v3.1+, placeholders below need v3.9) supports **Custom Market Data Providers** — you supply a
 URL template and a JSONPath expression; Wealthfolio substitutes the asset
 symbol, fetches the URL, and extracts the price. StocksBot's `/price` endpoint
 is designed to satisfy this contract directly.
@@ -282,7 +283,7 @@ Fill in the provider form with the following values:
 | Field | Value |
 |---|---|
 | **Source type** | `JSON` |
-| **URL** | `http://<host>:8150/price?isin={SYMBOL}&currency=EUR` |
+| **URL** | `http://<host>:8150/price?isin={ISIN}&currency={CURRENCY}` |
 | **Price path** | `$.price` |
 
 Replace `<host>` with the actual hostname or IP where StocksBot is running
@@ -290,11 +291,12 @@ Replace `<host>` with the actual hostname or IP where StocksBot is running
 
 **Notes**
 
-- `{SYMBOL}` is the placeholder that Wealthfolio replaces with the asset's
-  symbol at sync time. You will set each asset's symbol to its ISIN in
-  [Step 3](#step-3--assign-the-provider-to-an-asset).
-- If you want to fetch prices in a currency other than EUR, change `currency=EUR`
-  in the URL to the desired ISO 4217 code (e.g. `currency=GBP`).
+- `{ISIN}` and `{CURRENCY}` are filled in by Wealthfolio from the asset at sync
+  time (its ISIN identifier and quote currency), so the asset can keep its normal
+  ticker.
+- On older Wealthfolio versions, or for an asset without a stored ISIN, use
+  `isin={SYMBOL}&currency=EUR` instead and set that asset's symbol to its ISIN
+  (see [Step 3](#step-3--assign-the-provider-to-an-asset)).
 - The response `{ "price": 11.42 }` is parsed by the JSONPath expression
   `$.price`, which selects the top-level `price` field.
 
@@ -321,12 +323,59 @@ For each ETF or fund you want to price with StocksBot:
 1. Open the asset in Wealthfolio (**Assets** or from a portfolio holding).
 2. Under **Market Data**, set **Preferred Provider** to `FT Price Bot` (the
    name you gave in Step 1).
-3. Set the asset's **Symbol** to the ISIN (e.g. `LU1022659046`). This is the
-   value Wealthfolio will substitute into `{SYMBOL}` in the URL template.
+3. Make sure the asset has its ISIN recorded (it is substituted into `{ISIN}`).
+   If you used the `{SYMBOL}` form of the URL, set the asset's **Symbol** to the
+   ISIN instead (e.g. `LU1022659046`).
 4. Save.
 
 Wealthfolio will now use StocksBot to fetch the latest price for this asset
 during each sync cycle.
+
+---
+
+## Syncing fund classifications into Wealthfolio
+
+`sync_wealthfolio_taxonomies.py` pulls `/info` for each fund and writes its
+sector, region, asset-class and instrument-type breakdown into Wealthfolio's
+classification taxonomies, so allocation charts look *through* the fund.
+Wealthfolio fills sectors/asset class for ETFs that Yahoo covers, but not
+regions or funds Yahoo doesn't know, which is what this adds.
+
+It talks to the Wealthfolio server's REST API (the self-hosted web/Docker
+build), so Wealthfolio can keep running and every write goes through the app's
+own validation. Earlier versions edited the SQLite file directly; don't use
+those against Wealthfolio 3.8+.
+
+```bash
+pip install requests
+WF_URL=http://<wealthfolio-host>:8088 \
+WF_PASSWORD='<your Wealthfolio password>' \
+PRICE_BOT_URL=http://<host>:8150 \
+python3 sync_wealthfolio_taxonomies.py      # add DRY_RUN=1 to preview
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WF_URL` | `http://localhost:8088` | Wealthfolio server base URL |
+| `WF_PASSWORD` | — | Login password, when Wealthfolio auth is enabled |
+| `WF_TOKEN` | — | Alternatively, a bearer token for the API |
+| `PRICE_BOT_URL` | `http://localhost:8150` | StocksBot base URL |
+| `DRY_RUN` | off | `1`/`true` fetches and prints without writing |
+
+Behaviour:
+
+- Assets are those with a custom market-data provider (falling back to every
+  active asset with an ISIN).
+- Instrument type and asset class are single-choice and are set outright.
+- Sector and region weights replace the rows this script wrote before
+  (`source = auto_scraper`). Classifications you added by hand are kept when
+  they still fit within 100%.
+- FT labels that map to the same category are summed, and totals that FT's
+  rounding pushes over 100% are scaled down (Wealthfolio rejects them).
+- Unmapped FT labels get their own `FT_…` category, using the same ids as
+  earlier versions so nothing is duplicated.
+
+Tests: `pytest tests/test_taxonomy_sync.py`.
 
 ---
 
