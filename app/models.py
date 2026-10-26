@@ -24,4 +24,5 @@ class HistoryResponse(BaseModel):
     isin: str
     currency: str
     xid: str
+    symbol: str
     prices: List[HistoryPoint]

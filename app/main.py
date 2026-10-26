@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
-from app.cache import init_db, get_cached, set_cached, get_cached_xid, set_cached_xid
+from app.cache import init_db, get_cached, set_cached, get_cached_listing, set_cached_listing
 from app.history import fetch_history
 from app.models import BatchRequest, BatchResponse, HistoryResponse
 from app.scraper import scrape_price, PriceNotFoundError, FTBlockedError
@@ -77,9 +77,9 @@ async def get_history(
         raise HTTPException(status_code=400, detail=f"range is limited to {MAX_HISTORY_DAYS} days")
 
     isin, currency = isin.upper(), currency.upper()
-    cached_xid = await get_cached_xid(isin, currency)
+    cached = await get_cached_listing(isin, currency)
     try:
-        xid, rows = await fetch_history(isin, currency, start, end, xid=cached_xid)
+        xid, symbol, rows = await fetch_history(isin, currency, start, end, listing=cached)
     except PriceNotFoundError as e:
         log.warning("NOT FOUND  history %s/%s -> %s", isin, currency, e)
         raise HTTPException(status_code=404, detail=str(e))
@@ -90,10 +90,10 @@ async def get_history(
         log.error("ERROR      history %s/%s -> %s", isin, currency, e)
         raise HTTPException(status_code=500, detail=f"History error: {e}")
 
-    if xid != cached_xid:
-        await set_cached_xid(isin, currency, xid)
-    log.info("HISTORY    %s/%s %s..%s -> %d rows", isin, currency, start, end, len(rows))
-    return HistoryResponse(isin=isin, currency=currency, xid=xid, prices=rows)
+    if cached != (xid, symbol):
+        await set_cached_listing(isin, currency, xid, symbol)
+    log.info("HISTORY    %s/%s (%s) %s..%s -> %d rows", isin, currency, symbol, start, end, len(rows))
+    return HistoryResponse(isin=isin, currency=currency, xid=xid, symbol=symbol, prices=rows)
 
 
 @app.post("/batch", response_model=BatchResponse)

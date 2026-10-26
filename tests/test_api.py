@@ -165,17 +165,17 @@ def test_parse_history_html_skips_bad_rows():
 
 
 @pytest.mark.asyncio
-async def test_history_resolves_and_caches_xid(client):
+async def test_history_resolves_and_caches_listing(client):
     rows = [{"date": "2026-10-22", "open": None, "high": None, "low": None, "close": 24.31}]
-    with patch("app.main.fetch_history", new_callable=AsyncMock, return_value=("6011", rows)) as mock_fetch:
+    with patch("app.main.fetch_history", new_callable=AsyncMock, return_value=("6011", "LU0113257694:EUR", rows)) as mock_fetch:
         r1 = await client.get("/history?isin=lu0113257694&currency=eur&start=2026-10-01&end=2026-10-23")
         r2 = await client.get("/history?isin=LU0113257694&currency=EUR&start=2026-10-01&end=2026-10-23")
     assert r1.status_code == 200
-    assert r1.json() == {"isin": "LU0113257694", "currency": "EUR", "xid": "6011", "prices": rows}
+    assert r1.json() == {"isin": "LU0113257694", "currency": "EUR", "xid": "6011", "symbol": "LU0113257694:EUR", "prices": rows}
     assert r2.status_code == 200
     first, second = mock_fetch.await_args_list
-    assert first.kwargs["xid"] is None
-    assert second.kwargs["xid"] == "6011"
+    assert first.kwargs["listing"] is None
+    assert second.kwargs["listing"] == ("6011", "LU0113257694:EUR")
     assert first.args[2] == datetime.date(2026, 10, 1) and first.args[3] == datetime.date(2026, 10, 23)
 
 
@@ -201,3 +201,27 @@ async def test_history_ft_blocked(client):
     with patch("app.main.fetch_history", new_callable=AsyncMock, side_effect=FTBlockedError("403")):
         r = await client.get("/history?isin=LU0113257694")
     assert r.status_code == 503
+
+
+VANGUARD_LISTINGS = [
+    {"symbol": "VUSA:LSE:GBP", "xid": "46487963"},
+    {"symbol": "VUSD:LSE:USD", "xid": "46487965"},
+    {"symbol": "VUSA:AEX:EUR", "xid": "58518299"},
+]
+
+
+def test_pick_listing_matches_requested_currency():
+    from app.history import pick_listing
+    assert pick_listing(VANGUARD_LISTINGS, "IE00B3XXRP09", "USD")["symbol"] == "VUSD:LSE:USD"
+    assert pick_listing(VANGUARD_LISTINGS, "IE00B3XXRP09", "EUR")["symbol"] == "VUSA:AEX:EUR"
+
+
+def test_pick_listing_prefers_fund_share_class():
+    from app.history import pick_listing
+    listings = [{"symbol": "ZPJS:FRA:EUR", "xid": "1"}, {"symbol": "LU0113257694:EUR", "xid": "6011"}]
+    assert pick_listing(listings, "LU0113257694", "EUR")["xid"] == "6011"
+
+
+def test_pick_listing_refuses_other_currencies():
+    from app.history import pick_listing
+    assert pick_listing(VANGUARD_LISTINGS, "IE00B3XXRP09", "CHF") is None

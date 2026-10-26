@@ -4,15 +4,14 @@ import re
 
 import httpx
 
-from app.scraper import FTBlockedError, PriceNotFoundError, _USER_AGENT, _is_search_page
+from app.scraper import FTBlockedError, PriceNotFoundError, _USER_AGENT
 
-FT_SUMMARY_URL = "https://markets.ft.com/data/funds/tearsheet/summary"
+FT_SEARCH_URL = "https://markets.ft.com/data/searchapi/searchsecurities"
 FT_HISTORY_URL = "https://markets.ft.com/data/equities/ajax/get-historical-prices"
 
 # FT returns at most about a year of rows per request, so longer ranges are fetched in chunks
 _CHUNK_DAYS = 365
 
-_XID_RE = re.compile(r'&quot;xid&quot;:&quot;(\d+)&quot;')
 _ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
 _CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
 _LONG_DATE_RE = re.compile(r'mod-ui-hide-small-below">([^<]+)<')
@@ -59,17 +58,33 @@ def _check_response(response: httpx.Response, isin: str):
     response.raise_for_status()
 
 
-async def resolve_xid(client: httpx.AsyncClient, isin: str, currency: str) -> str:
-    """Find FT's internal security id (xid) for an ISIN, trying ISIN:CCY first, then the bare ISIN."""
-    for symbol in (f"{isin}:{currency}", isin):
-        response = await client.get(FT_SUMMARY_URL, params={"s": symbol})
-        _check_response(response, isin)
-        if _is_search_page(str(response.url)):
-            continue
-        match = _XID_RE.search(response.text)
-        if match:
-            return match.group(1)
-    raise PriceNotFoundError(f"FT has no page for ISIN {isin}")
+def pick_listing(securities: list[dict], isin: str, currency: str) -> dict | None:
+    """Choose the FT listing quoted in `currency`: the fund share class ISIN:CCY first, then any exchange listing ending :CCY."""
+    exact = f"{isin}:{currency}"
+    for security in securities:
+        if security.get("symbol") == exact:
+            return security
+    for security in securities:
+        if str(security.get("symbol", "")).endswith(f":{currency}"):
+            return security
+    return None
+
+
+async def resolve_listing(client: httpx.AsyncClient, isin: str, currency: str) -> tuple[str, str]:
+    """Return (xid, symbol) for the FT listing of an ISIN quoted in the requested currency.
+
+    FT falls back to a default listing when ISIN:CCY has no page, which can be in another
+    currency (e.g. VUSA in GBP for a USD request), so the listing is chosen from FT's search
+    results by its currency suffix instead.
+    """
+    response = await client.get(FT_SEARCH_URL, params={"query": isin})
+    _check_response(response, isin)
+    securities = response.json().get("data", {}).get("security", [])
+    listing = pick_listing(securities, isin, currency)
+    if listing is None:
+        found = ", ".join(s.get("symbol", "?") for s in securities) or "nothing"
+        raise PriceNotFoundError(f"FT has no {currency} listing for ISIN {isin} (found {found})")
+    return str(listing["xid"]), listing["symbol"]
 
 
 async def fetch_history(
@@ -77,14 +92,14 @@ async def fetch_history(
     currency: str,
     start: datetime.date,
     end: datetime.date,
-    xid: str | None = None,
-) -> tuple[str, list[dict]]:
-    """Return (xid, rows) with FT daily prices between start and end inclusive, oldest first."""
+    listing: tuple[str, str] | None = None,
+) -> tuple[str, str, list[dict]]:
+    """Return (xid, symbol, rows) with FT daily prices between start and end inclusive, oldest first."""
     isin, currency = isin.upper(), currency.upper()
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT}, follow_redirects=True, timeout=30
     ) as client:
-        xid = xid or await resolve_xid(client, isin, currency)
+        xid, symbol = listing or await resolve_listing(client, isin, currency)
         by_date: dict[str, dict] = {}
         chunk_start = start
         while chunk_start <= end:
@@ -98,4 +113,4 @@ async def fetch_history(
             for row in parse_history_html(response.json().get("html", "")):
                 by_date[row["date"]] = row
             chunk_start = chunk_end + datetime.timedelta(days=1)
-    return xid, [by_date[d] for d in sorted(by_date)]
+    return xid, symbol, [by_date[d] for d in sorted(by_date)]
