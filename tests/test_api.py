@@ -38,11 +38,11 @@ async def client(use_tmp_db):
 # ---------------------------------------------------------------------------
 
 async def _insert_price(db_path, isin, currency, price, date=None):
-    date = date or datetime.datetime.now(datetime.UTC).date().isoformat()
+    date = date or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "INSERT OR REPLACE INTO prices(isin,currency,date,price,fetched_at) VALUES(?,?,?,?,?)",
-            (isin, currency, date, price, datetime.datetime.now(datetime.UTC).isoformat()),
+            (isin, currency, date, price, datetime.datetime.now(datetime.timezone.utc).isoformat()),
         )
         await db.commit()
 
@@ -126,7 +126,7 @@ async def test_batch_mixed_results(client):
 
 @pytest.mark.asyncio
 async def test_cache_expiry_triggers_rescrape(client, use_tmp_db):
-    yesterday = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).date().isoformat()
+    yesterday = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).date().isoformat()
     await _insert_price(use_tmp_db, "LU1022659046", "EUR", 9.99, date=yesterday)
 
     with patch("app.main.scrape_price", new_callable=AsyncMock, return_value=10.19) as mock_scrape:
@@ -134,3 +134,70 @@ async def test_cache_expiry_triggers_rescrape(client, use_tmp_db):
     assert r.status_code == 200
     assert r.json() == {"price": 10.19}
     mock_scrape.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
+FT_ROWS = (
+    '<tr><td class="mod-ui-table__cell--text"><span class="mod-ui-hide-small-below">Friday, October 23, 2026</span>'
+    '<span class="mod-ui-hide-medium-above">Fri, Oct 23, 2026</span></td><td>24.31</td><td>24.31</td><td>24.31</td>'
+    '<td>24.31</td><td><span class="mod-ui-hide-small-below">0</span><span class="mod-ui-hide-medium-above">0.00</span></td></tr>'
+    '<tr><td class="mod-ui-table__cell--text"><span class="mod-ui-hide-small-below">Thursday, October 22, 2026</span>'
+    '<span class="mod-ui-hide-medium-above">Thu, Oct 22, 2026</span></td><td>1,024.30</td><td>1,024.30</td><td>1,024.30</td>'
+    '<td>1,024.30</td><td><span class="mod-ui-hide-small-below">0</span><span class="mod-ui-hide-medium-above">0.00</span></td></tr>'
+)
+
+
+def test_parse_history_html():
+    from app.history import parse_history_html
+    rows = parse_history_html(FT_ROWS)
+    assert rows == [
+        {"date": "2026-10-23", "open": 24.31, "high": 24.31, "low": 24.31, "close": 24.31},
+        {"date": "2026-10-22", "open": 1024.3, "high": 1024.3, "low": 1024.3, "close": 1024.3},
+    ]
+
+
+def test_parse_history_html_skips_bad_rows():
+    from app.history import parse_history_html
+    assert parse_history_html("<tr><td>Date</td><td>Open</td></tr>") == []
+
+
+@pytest.mark.asyncio
+async def test_history_resolves_and_caches_xid(client):
+    rows = [{"date": "2026-10-22", "open": None, "high": None, "low": None, "close": 24.31}]
+    with patch("app.main.fetch_history", new_callable=AsyncMock, return_value=("6011", rows)) as mock_fetch:
+        r1 = await client.get("/history?isin=lu0113257694&currency=eur&start=2026-10-01&end=2026-10-23")
+        r2 = await client.get("/history?isin=LU0113257694&currency=EUR&start=2026-10-01&end=2026-10-23")
+    assert r1.status_code == 200
+    assert r1.json() == {"isin": "LU0113257694", "currency": "EUR", "xid": "6011", "prices": rows}
+    assert r2.status_code == 200
+    first, second = mock_fetch.await_args_list
+    assert first.kwargs["xid"] is None
+    assert second.kwargs["xid"] == "6011"
+    assert first.args[2] == datetime.date(2026, 10, 1) and first.args[3] == datetime.date(2026, 10, 23)
+
+
+@pytest.mark.asyncio
+async def test_history_rejects_reversed_range(client):
+    with patch("app.main.fetch_history", new_callable=AsyncMock) as mock_fetch:
+        r = await client.get("/history?isin=LU0113257694&start=2026-10-23&end=2026-10-01")
+    assert r.status_code == 400
+    mock_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_history_not_found(client):
+    from app.scraper import PriceNotFoundError
+    with patch("app.main.fetch_history", new_callable=AsyncMock, side_effect=PriceNotFoundError("no page")):
+        r = await client.get("/history?isin=XX0000000000")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_history_ft_blocked(client):
+    from app.scraper import FTBlockedError
+    with patch("app.main.fetch_history", new_callable=AsyncMock, side_effect=FTBlockedError("403")):
+        r = await client.get("/history?isin=LU0113257694")
+    assert r.status_code == 503

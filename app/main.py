@@ -1,12 +1,13 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
-from app.cache import init_db, get_cached, set_cached
-from app.models import BatchRequest, BatchResponse
+from app.cache import init_db, get_cached, set_cached, get_cached_xid, set_cached_xid
+from app.history import fetch_history
+from app.models import BatchRequest, BatchResponse, HistoryResponse
 from app.scraper import scrape_price, PriceNotFoundError, FTBlockedError
 
 logging.basicConfig(
@@ -16,6 +17,8 @@ logging.basicConfig(
 )
 logging.Formatter.converter = lambda *args: datetime.now(timezone.utc).timetuple()
 log = logging.getLogger(__name__)
+
+MAX_HISTORY_DAYS = 365 * 15
 
 
 @asynccontextmanager
@@ -57,6 +60,40 @@ async def get_price(
     await set_cached(isin, currency, price)
     log.info("SCRAPED    %s/%s -> %s", isin.upper(), currency.upper(), price)
     return {"price": price}
+
+
+@app.get("/history", response_model=HistoryResponse)
+async def get_history(
+    isin: str = Query(..., min_length=12, max_length=12),
+    currency: str = Query("EUR", min_length=3, max_length=3),
+    start: date | None = Query(None, description="First date (YYYY-MM-DD); defaults to a year before end"),
+    end: date | None = Query(None, description="Last date (YYYY-MM-DD); defaults to today"),
+):
+    end = end or datetime.now(timezone.utc).date()
+    start = start or end - timedelta(days=365)
+    if start > end:
+        raise HTTPException(status_code=400, detail="start must be on or before end")
+    if (end - start).days > MAX_HISTORY_DAYS:
+        raise HTTPException(status_code=400, detail=f"range is limited to {MAX_HISTORY_DAYS} days")
+
+    isin, currency = isin.upper(), currency.upper()
+    cached_xid = await get_cached_xid(isin, currency)
+    try:
+        xid, rows = await fetch_history(isin, currency, start, end, xid=cached_xid)
+    except PriceNotFoundError as e:
+        log.warning("NOT FOUND  history %s/%s -> %s", isin, currency, e)
+        raise HTTPException(status_code=404, detail=str(e))
+    except FTBlockedError as e:
+        log.warning("BLOCKED    history %s/%s -> %s", isin, currency, e)
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        log.error("ERROR      history %s/%s -> %s", isin, currency, e)
+        raise HTTPException(status_code=500, detail=f"History error: {e}")
+
+    if xid != cached_xid:
+        await set_cached_xid(isin, currency, xid)
+    log.info("HISTORY    %s/%s %s..%s -> %d rows", isin, currency, start, end, len(rows))
+    return HistoryResponse(isin=isin, currency=currency, xid=xid, prices=rows)
 
 
 @app.post("/batch", response_model=BatchResponse)
