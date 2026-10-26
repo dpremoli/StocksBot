@@ -27,10 +27,18 @@ over a simple JSON REST API. Designed to integrate with
 
 ## How It Works
 
-StocksBot launches a headless Chromium browser (via Playwright) and navigates
-to the FT tearsheet page for the requested ISIN. It extracts the NAV/price,
-converts pence-quoted instruments (GBp / GBX) to GBP automatically, and
-returns the value as JSON.
+StocksBot first finds the FT listing of the ISIN quoted in the requested
+currency, using FT's security search: the fund share class `ISIN:CCY` if there
+is one, otherwise an exchange listing ending `:CCY` (e.g. `VUSD:LSE:USD`), or
+for `GBP` a London listing quoted in pence (`:GBX`, or a share on its home
+exchange such as `RR.:LSE`). If FT has no listing in that currency
+the request fails with `404` rather than returning a price in another currency.
+
+For `/price` it then launches a headless Chromium browser (via Playwright),
+opens that listing's FT tearsheet, extracts the NAV/price, converts
+pence-quoted instruments (GBp / GBX) to GBP automatically, and returns the
+value as JSON. `/history` reads FT's daily price table for the same listing
+over plain HTTP, without the browser.
 
 Results are cached in a local SQLite database for the rest of the calendar day
 so that repeated calls to Wealthfolio's sync cycle do not trigger additional
@@ -153,9 +161,42 @@ curl "http://localhost:8150/price?isin=LU1022659046&currency=EUR"
 | Status | Meaning |
 |---|---|
 | `400` | Invalid ISIN length |
-| `404` | ISIN not found on FT |
+| `404` | ISIN not found on FT, or no FT listing in the requested currency |
 | `503` | FT returned 403 (rate-limited / blocked) |
 | `500` | Unexpected scraping error |
+
+---
+
+### `GET /history`
+
+Fetch daily prices for a date range from FT's historical-prices table.
+
+**Query parameters**
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `isin` | Yes | — | 12-character ISIN |
+| `currency` | No | `EUR` | ISO 4217 currency code |
+| `start` | No | a year before `end` | First date, `YYYY-MM-DD` |
+| `end` | No | today | Last date, `YYYY-MM-DD` (range limited to 15 years) |
+
+**Example**
+```bash
+curl "http://localhost:8150/history?isin=LU0113257694&currency=EUR&start=2026-10-21&end=2026-10-22"
+```
+
+**Success response** `200 OK` — `symbol` is the FT listing the prices come from
+```json
+{
+  "isin": "LU0113257694", "currency": "EUR", "xid": "6011", "symbol": "LU0113257694:EUR",
+  "prices": [
+    { "date": "2026-10-21", "open": 24.34, "high": 24.34, "low": 24.34, "close": 24.34 },
+    { "date": "2026-10-22", "open": 24.31, "high": 24.31, "low": 24.31, "close": 24.31 }
+  ]
+}
+```
+
+Errors are as for `/price`, plus `400` when `start` is after `end`.
 
 ---
 
@@ -300,6 +341,24 @@ Replace `<host>` with the actual hostname or IP where StocksBot is running
 - The response `{ "price": 11.42 }` is parsed by the JSONPath expression
   `$.price`, which selects the top-level `price` field.
 
+**Historical source (optional)**
+
+Enable the provider's historical source too, so Wealthfolio can fill in past
+prices from FT instead of only collecting them from the day you add the asset:
+
+| Field | Value |
+|---|---|
+| **Source type** | `JSON` |
+| **URL** | `http://<host>:8150/history?isin={ISIN}&currency={CURRENCY}&start={FROM:%Y-%m-%d}&end={TO:%Y-%m-%d}` |
+| **Price path** | `$.prices[*].close` |
+| **Date path** | `$.prices[*].date` |
+| **Date format** | `%Y-%m-%d` |
+| **Open / High / Low paths** | `$.prices[*].open`, `$.prices[*].high`, `$.prices[*].low` |
+
+Wealthfolio does not offer "reset history" for custom providers, so for an
+asset that already has prices from another provider, import the older
+`/history` rows as manual quotes if you want them replaced.
+
 **Test the provider**
 
 Click **Test** (or **Fetch**) inside Wealthfolio's provider editor. Enter a
@@ -387,6 +446,10 @@ triggers a live scrape; subsequent requests return the cached value.
 
 Fund info (`/info`, `/batch-info`) is cached with the same daily key.
 
+The FT listing chosen for each `(ISIN, currency)` is cached without expiry in
+the `listings` table, so FT's search is only queried once per instrument.
+`/history` results are not cached.
+
 The cache file is stored at `/data/prices.db` inside the container. To clear
 the cache, stop the container and delete the file (or the entire `/data`
 directory), then restart.
@@ -398,7 +461,7 @@ directory), then restart.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `503` from `/price` | FT blocked the scraper | Wait a few minutes and retry; persistent blocks may require running behind a residential proxy |
-| `404` from `/price` | ISIN not listed on FT Markets | Verify the ISIN on `markets.ft.com` manually |
+| `404` from `/price` | ISIN not listed on FT Markets, or not in that currency | The error lists the listings FT has; request one of those currencies |
 | Wealthfolio shows "Provider error" | URL unreachable from Wealthfolio | Check network connectivity; use LAN IP instead of `localhost` if both are in Docker |
 | Stale price in Wealthfolio | Cache not yet expired | Cache resets at midnight UTC; use `/price` directly to confirm |
 | Container OOM | Chromium memory spike | Increase the `memory` limit in `docker-compose.yml` (default 1 GB) |

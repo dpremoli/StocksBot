@@ -35,3 +35,19 @@ class BatchInfoRequest(BaseModel):
 class BatchInfoResponse(BaseModel):
     info: Dict[str, FundInfo]
     errors: Dict[str, str] = {}
+
+
+class HistoryPoint(BaseModel):
+    date: str
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: float
+
+
+class HistoryResponse(BaseModel):
+    isin: str
+    currency: str
+    xid: str
+    symbol: str
+    prices: List[HistoryPoint]

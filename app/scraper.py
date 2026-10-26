@@ -4,8 +4,8 @@ import re
 from playwright.async_api import async_playwright, Browser
 from playwright.async_api import TimeoutError as PwTimeout
 
-FT_URL = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}:{currency}"
-FT_URL_NO_CCY = "https://markets.ft.com/data/etfs/tearsheet/summary?s={isin}"
+# symbol is an FT listing such as LU0113257694:EUR or VUSD:LSE:USD (see app.listings)
+FT_URL = "https://markets.ft.com/data/etfs/tearsheet/summary?s={symbol}"
 
 # Holdings tab — tried in order: ETF+ccy, Fund+ccy, ETF no-ccy, Fund no-ccy
 _HOLDINGS_URLS = [
@@ -355,7 +355,8 @@ async def scrape_fund_info(isin: str, currency: str) -> dict:
             await context.close()
 
 
-async def scrape_price(isin: str, currency: str) -> float:
+async def scrape_price(symbol: str) -> float:
+    """Scrape the latest price from the FT tearsheet of one specific listing."""
     async with _semaphore:
         browser = await get_browser()
         context = await browser.new_context(
@@ -364,24 +365,21 @@ async def scrape_price(isin: str, currency: str) -> float:
         )
         page = await context.new_page()
         try:
-            url = FT_URL.format(isin=isin.upper(), currency=currency.upper())
+            url = FT_URL.format(symbol=symbol)
             response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             if response and response.status == 403:
-                raise FTBlockedError(f"FT returned 403 for {isin}")
+                raise FTBlockedError(f"FT returned 403 for {symbol}")
 
+            # No fallback to the bare ISIN: FT's default listing can be in another currency
             if _is_search_page(page.url):
-                url_no_ccy = FT_URL_NO_CCY.format(isin=isin.upper())
-                response = await page.goto(url_no_ccy, wait_until="domcontentloaded", timeout=30000)
-
-            if _is_search_page(page.url):
-                raise PriceNotFoundError(f"FT has no page for ISIN {isin}")
+                raise PriceNotFoundError(f"FT has no page for {symbol}")
 
             price = await _extract_price(page)
             if price is not None:
                 return price
 
-            raise PriceNotFoundError(f"Could not extract price for {isin} from {page.url}")
+            raise PriceNotFoundError(f"Could not extract price for {symbol} from {page.url}")
 
         finally:
             await context.close()
