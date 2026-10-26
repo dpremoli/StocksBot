@@ -23,6 +23,15 @@ def use_tmp_db(tmp_path, monkeypatch):
     return db_file
 
 
+@pytest.fixture(autouse=True)
+def fake_listing():
+    """FT search is mocked: every ISIN has a fund listing ISIN:CCY unless a test overrides it."""
+    async def find(isin, currency):
+        return ("1", f"{isin}:{currency}")
+    with patch("app.main.find_listing", new_callable=AsyncMock, side_effect=find) as mock_find:
+        yield mock_find
+
+
 @pytest_asyncio.fixture
 async def client(use_tmp_db):
     # ASGITransport does not trigger FastAPI lifespan, so init the DB explicitly
@@ -64,7 +73,7 @@ async def test_price_cache_miss_then_scrape(client):
         r = await client.get("/price?isin=LU1022659046&currency=EUR")
     assert r.status_code == 200
     assert r.json() == {"price": 11.5}
-    mock_scrape.assert_awaited_once_with("LU1022659046", "EUR")
+    mock_scrape.assert_awaited_once_with("LU1022659046:EUR")
 
 
 @pytest.mark.asyncio
@@ -107,8 +116,8 @@ async def test_price_ft_blocked(client):
 async def test_batch_mixed_results(client):
     from app.scraper import PriceNotFoundError
 
-    async def fake_scrape(isin, currency):
-        if isin == "LU1022659046":
+    async def fake_scrape(symbol):
+        if symbol == "LU1022659046:EUR":
             return 10.19
         raise PriceNotFoundError("not found")
 
@@ -165,7 +174,9 @@ def test_parse_history_html_skips_bad_rows():
 
 
 @pytest.mark.asyncio
-async def test_history_resolves_and_caches_listing(client):
+async def test_history_resolves_and_caches_listing(client, fake_listing):
+    fake_listing.side_effect = None
+    fake_listing.return_value = ("6011", "LU0113257694:EUR")
     rows = [{"date": "2026-10-22", "open": None, "high": None, "low": None, "close": 24.31}]
     with patch("app.main.fetch_history", new_callable=AsyncMock, return_value=("6011", "LU0113257694:EUR", rows)) as mock_fetch:
         r1 = await client.get("/history?isin=lu0113257694&currency=eur&start=2026-10-01&end=2026-10-23")
@@ -174,8 +185,8 @@ async def test_history_resolves_and_caches_listing(client):
     assert r1.json() == {"isin": "LU0113257694", "currency": "EUR", "xid": "6011", "symbol": "LU0113257694:EUR", "prices": rows}
     assert r2.status_code == 200
     first, second = mock_fetch.await_args_list
-    assert first.kwargs["listing"] is None
-    assert second.kwargs["listing"] == ("6011", "LU0113257694:EUR")
+    assert first.kwargs["listing"] == second.kwargs["listing"] == ("6011", "LU0113257694:EUR")
+    fake_listing.assert_awaited_once()
     assert first.args[2] == datetime.date(2026, 10, 1) and first.args[3] == datetime.date(2026, 10, 23)
 
 
@@ -211,17 +222,47 @@ VANGUARD_LISTINGS = [
 
 
 def test_pick_listing_matches_requested_currency():
-    from app.history import pick_listing
+    from app.listings import pick_listing
     assert pick_listing(VANGUARD_LISTINGS, "IE00B3XXRP09", "USD")["symbol"] == "VUSD:LSE:USD"
     assert pick_listing(VANGUARD_LISTINGS, "IE00B3XXRP09", "EUR")["symbol"] == "VUSA:AEX:EUR"
 
 
 def test_pick_listing_prefers_fund_share_class():
-    from app.history import pick_listing
+    from app.listings import pick_listing
     listings = [{"symbol": "ZPJS:FRA:EUR", "xid": "1"}, {"symbol": "LU0113257694:EUR", "xid": "6011"}]
     assert pick_listing(listings, "LU0113257694", "EUR")["xid"] == "6011"
 
 
 def test_pick_listing_refuses_other_currencies():
-    from app.history import pick_listing
+    from app.listings import pick_listing
     assert pick_listing(VANGUARD_LISTINGS, "IE00B3XXRP09", "CHF") is None
+
+
+@pytest.mark.asyncio
+async def test_price_uses_listing_in_requested_currency(client, fake_listing):
+    fake_listing.side_effect = None
+    fake_listing.return_value = ("46487965", "VUSD:LSE:USD")
+    with patch("app.main.scrape_price", new_callable=AsyncMock, return_value=122.82) as mock_scrape:
+        r = await client.get("/price?isin=IE00B3XXRP09&currency=USD")
+    assert r.json() == {"price": 122.82}
+    mock_scrape.assert_awaited_once_with("VUSD:LSE:USD")
+
+
+@pytest.mark.asyncio
+async def test_price_not_found_when_no_listing_in_currency(client, fake_listing):
+    from app.scraper import PriceNotFoundError
+    fake_listing.side_effect = PriceNotFoundError("FT has no JPY listing")
+    with patch("app.main.scrape_price", new_callable=AsyncMock) as mock_scrape:
+        r = await client.get("/price?isin=IE00B3XXRP09&currency=JPY")
+    assert r.status_code == 404
+    mock_scrape.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_price_and_history_share_cached_listing(client, fake_listing):
+    rows = [{"date": "2026-10-22", "open": None, "high": None, "low": None, "close": 24.31}]
+    with patch("app.main.scrape_price", new_callable=AsyncMock, return_value=24.31), \
+         patch("app.main.fetch_history", new_callable=AsyncMock, return_value=("1", "LU0113257694:EUR", rows)):
+        await client.get("/price?isin=LU0113257694&currency=EUR")
+        await client.get("/history?isin=LU0113257694&currency=EUR")
+    fake_listing.assert_awaited_once()

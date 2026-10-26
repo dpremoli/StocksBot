@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from app.cache import init_db, get_cached, set_cached, get_cached_listing, set_cached_listing
 from app.history import fetch_history
+from app.listings import find_listing
 from app.models import BatchRequest, BatchResponse, HistoryResponse
 from app.scraper import scrape_price, PriceNotFoundError, FTBlockedError
 
@@ -30,6 +31,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FT NAV Price Bot", lifespan=lifespan)
 
 
+async def resolve_listing(isin: str, currency: str) -> tuple[str, str]:
+    """(xid, symbol) of the FT listing of isin quoted in currency, from cache or FT search."""
+    listing = await get_cached_listing(isin, currency)
+    if listing is None:
+        listing = await find_listing(isin, currency)
+        await set_cached_listing(isin, currency, *listing)
+    return listing
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -40,13 +50,15 @@ async def get_price(
     isin: str = Query(..., min_length=12, max_length=12),
     currency: str = Query("EUR", min_length=3, max_length=3),
 ):
+    isin, currency = isin.upper(), currency.upper()
     cached = await get_cached(isin, currency)
     if cached is not None:
-        log.info("CACHE HIT  %s/%s -> %s", isin.upper(), currency.upper(), cached)
+        log.info("CACHE HIT  %s/%s -> %s", isin, currency, cached)
         return {"price": cached}
 
     try:
-        price = await scrape_price(isin, currency)
+        _, symbol = await resolve_listing(isin, currency)
+        price = await scrape_price(symbol)
     except PriceNotFoundError as e:
         log.warning("NOT FOUND  %s/%s -> %s", isin.upper(), currency.upper(), e)
         raise HTTPException(status_code=404, detail=str(e))
@@ -58,7 +70,7 @@ async def get_price(
         raise HTTPException(status_code=500, detail=f"Scrape error: {e}")
 
     await set_cached(isin, currency, price)
-    log.info("SCRAPED    %s/%s -> %s", isin.upper(), currency.upper(), price)
+    log.info("SCRAPED    %s/%s (%s) -> %s", isin, currency, symbol, price)
     return {"price": price}
 
 
@@ -77,9 +89,9 @@ async def get_history(
         raise HTTPException(status_code=400, detail=f"range is limited to {MAX_HISTORY_DAYS} days")
 
     isin, currency = isin.upper(), currency.upper()
-    cached = await get_cached_listing(isin, currency)
     try:
-        xid, symbol, rows = await fetch_history(isin, currency, start, end, listing=cached)
+        listing = await resolve_listing(isin, currency)
+        xid, symbol, rows = await fetch_history(isin, currency, start, end, listing=listing)
     except PriceNotFoundError as e:
         log.warning("NOT FOUND  history %s/%s -> %s", isin, currency, e)
         raise HTTPException(status_code=404, detail=str(e))
@@ -90,8 +102,6 @@ async def get_history(
         log.error("ERROR      history %s/%s -> %s", isin, currency, e)
         raise HTTPException(status_code=500, detail=f"History error: {e}")
 
-    if cached != (xid, symbol):
-        await set_cached_listing(isin, currency, xid, symbol)
     log.info("HISTORY    %s/%s (%s) %s..%s -> %d rows", isin, currency, symbol, start, end, len(rows))
     return HistoryResponse(isin=isin, currency=currency, xid=xid, symbol=symbol, prices=rows)
 
@@ -107,10 +117,11 @@ async def batch_prices(body: BatchRequest):
             prices[isin] = cached
             continue
         try:
-            price = await scrape_price(isin, body.currency)
+            _, symbol = await resolve_listing(isin.upper(), body.currency.upper())
+            price = await scrape_price(symbol)
             await set_cached(isin, body.currency, price)
             prices[isin] = price
-            log.info("SCRAPED    %s/%s -> %s", isin.upper(), body.currency.upper(), price)
+            log.info("SCRAPED    %s/%s (%s) -> %s", isin.upper(), body.currency.upper(), symbol, price)
         except PriceNotFoundError:
             errors[isin] = "not_found"
             log.warning("NOT FOUND  %s/%s", isin.upper(), body.currency.upper())
